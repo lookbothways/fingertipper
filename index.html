@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Fingertip box scaler</title>
+<style>
+  :root {
+    --pineapple: #FCDA3F;
+    --side: 80vmin;
+  }
+  @supports (height: 1dvh) {
+    :root { --side: min(80dvw, 80dvh); }
+  }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--pineapple);
+    overflow: hidden;
+  }
+  body {
+    display: grid;
+    place-items: center;
+  }
+  #frame {
+    position: relative;
+    width: var(--side);
+    height: var(--side);
+  }
+  #stage {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+  #note {
+    position: absolute;
+    inset: 0;
+    margin: 0;
+    padding: 14%;
+    border: 0;
+    background: none;
+    color: #3B2F04;
+    font: 500 clamp(13px, 2.2vmin, 17px)/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    text-align: center;
+    cursor: pointer;
+  }
+  #note[hidden] { display: none; }
+  #note:focus-visible { outline: 2px solid #3B2F04; outline-offset: -6px; }
+  video {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="frame">
+  <canvas id="stage" aria-label="Live camera image split into a grid that stretches around your fingertips"></canvas>
+  <button id="note" type="button" hidden></button>
+</div>
+<video id="cam" playsinline muted autoplay></video>
+
+<script type="module">
+/* ---------- config ---------- */
+const TASKS_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1";
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+const TIP_IDS   = [4, 8, 12, 16, 20];          // thumb, index, middle, ring, pinky tips
+
+const MAX_DEPTH = 9;       // deepest split level
+const MIN_CELL  = 0.018;   // smallest cell edge (fraction of square)
+const DISTORT   = 5;       // fisheye strength per split
+const REACH     = 0.10;    // how far a fingertip's pull reaches
+const EASE      = 12;      // how quickly splits follow (per second)
+
+const PINEAPPLE = "#FCDA3F";
+const WAIT_FILL = "#EFC52B";
+const LINE      = "rgba(244, 242, 234, 0.92)";
+const INK       = "rgba(250, 249, 244, 0.82)";
+const MONO      = 'ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace';
+
+/* ---------- elements ---------- */
+const frameEl = document.getElementById("frame");
+const canvas  = document.getElementById("stage");
+const ctx     = canvas.getContext("2d");
+const note    = document.getElementById("note");
+const video   = document.getElementById("cam");
+const buf     = document.createElement("canvas");   // mirrored square crop of the camera
+const bctx    = buf.getContext("2d");
+
+const clamp   = (v, a, b) => Math.min(b, Math.max(a, v));
+const clamp01 = v => clamp(v, 0, 1);
+
+/* ---------- binary space partition ---------- */
+let root, leaves, splits, treeDepth;
+
+function buildTree() {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    leaves = []; splits = []; treeDepth = 0;
+    let index = 0;
+    const grow = (u, v, w, h, depth, vigour) => {
+      const node = { u, v, w, h, depth, x: u, y: v, W: w, H: h };
+      treeDepth = Math.max(treeDepth, depth);
+      const stop = depth >= MAX_DEPTH || Math.max(w, h) < MIN_CELL * 2 ||
+                   (depth >= 2 && Math.random() > vigour);
+      if (stop) { node.leaf = true; node.index = index++; leaves.push(node); return node; }
+
+      const r = w / h;
+      node.ax = r > 1.7 ? 0 : r < 1 / 1.7 ? 1 : (Math.random() < 0.5 ? 0 : 1); // 0: vertical cut, 1: horizontal cut
+      node.s = node.d = 0.3 + Math.random() * 0.4;                              // s: resting split, d: live split
+      const next = () => Math.min(1, vigour * (0.8 + Math.random() * 0.26));
+      if (node.ax === 0) {
+        const a = w * node.s;
+        node.a = grow(u, v, a, h, depth + 1, next());
+        node.b = grow(u + a, v, w - a, h, depth + 1, next());
+      } else {
+        const a = h * node.s;
+        node.a = grow(u, v, w, a, depth + 1, next());
+        node.b = grow(u, v + a, w, h - a, depth + 1, next());
+      }
+      splits.push(node);
+      return node;
+    };
+    root = grow(0, 0, 1, 1, 0, 1);
+    if (leaves.length >= 70 && leaves.length <= 150) break;
+  }
+}
+
+/* 1-D fisheye: where the resting split s lands when the focus sits at f */
+function fisheye(s, f, D) {
+  if (s >= f) {
+    const r = 1 - f; if (r < 1e-6) return s;
+    const t = (s - f) / r;
+    return f + r * (D + 1) * t / (D * t + 1);
+  }
+  const r = f; if (r < 1e-6) return s;
+  const t = (f - s) / r;
+  return f - r * (D + 1) * t / (D * t + 1);
+}
+
+/* move every split toward the layout the fingertips ask for */
+function relax(dt) {
+  const k = 1 - Math.exp(-EASE * dt);
+  for (const n of splits) {
+    let pull = 0, weight = 0;
+    for (const t of tips) {
+      const dx = Math.max(n.u - t.x, 0, t.x - (n.u + n.w));
+      const dy = Math.max(n.v - t.y, 0, t.y - (n.v + n.h));
+      const h = Math.exp(-(dx * dx + dy * dy) / (REACH * REACH));
+      if (h < 0.002) continue;
+      const f = n.ax === 0 ? (t.x - n.u) / n.w : (t.y - n.v) / n.h;
+      const D = DISTORT * (0.5 + 0.5 * Math.min(1, n.depth / 3));
+      pull += h * (fisheye(n.s, clamp01(f), D) - n.s);
+      weight += h;
+    }
+    const target = clamp(n.s + pull / Math.max(1, weight), 0.012, 0.988);
+    n.d += (target - n.d) * k;
+  }
+}
+
+function place(n, x, y, W, H) {
+  n.x = x; n.y = y; n.W = W; n.H = H;
+  if (n.leaf) return;
+  if (n.ax === 0) { const a = W * n.d; place(n.a, x, y, a, H); place(n.b, x + a, y, W - a, H); }
+  else            { const a = H * n.d; place(n.a, x, y, W, a); place(n.b, x, y + a, W, H - a); }
+}
+
+/* where a point of the camera image ends up on screen */
+function mapPoint(px, py) {
+  let n = root;
+  while (!n.leaf) {
+    const cut = n.ax === 0 ? n.u + n.w * n.s : n.v + n.h * n.s;
+    n = (n.ax === 0 ? px : py) < cut ? n.a : n.b;
+  }
+  return [n.x + (px - n.u) / n.w * n.W, n.y + (py - n.v) / n.h * n.H];
+}
+
+/* ---------- camera ---------- */
+let live = false;
+
+function showNote(text) { note.textContent = text; note.hidden = false; }
+function hideNote() { note.hidden = true; }
+
+async function startCamera() {
+  hideNote();
+  if (!navigator.mediaDevices?.getUserMedia) {
+    showNote("The camera only works on a secure page. Open this file from localhost or an https address.");
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    live = true;
+  } catch (err) {
+    const name = err?.name || "Error";
+    if (name === "NotAllowedError" || name === "SecurityError")
+      showNote("Camera access is blocked. Allow the camera for this page in your browser’s site settings, then click to try again.");
+    else if (name === "NotFoundError" || name === "OverconstrainedError")
+      showNote("No camera was found. Connect one, then click to try again.");
+    else if (name === "NotReadableError")
+      showNote("Another app is using the camera. Close it, then click to try again.");
+    else
+      showNote(`The camera couldn’t start (${name}). Click to try again.`);
+  }
+}
+note.addEventListener("click", startCamera);
+
+/* mirrored, centred square crop of the current camera frame */
+let crop = { ox: 0, oy: 0, side: 1, vw: 1, vh: 1 };
+function grabFrame() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return false;
+  const side = Math.min(vw, vh);
+  crop = { ox: (vw - side) / 2, oy: (vh - side) / 2, side, vw, vh };
+  const F = Math.min(side, 1080);
+  if (buf.width !== F) { buf.width = buf.height = F; }
+  bctx.setTransform(-1, 0, 0, 1, F, 0);
+  bctx.drawImage(video, crop.ox, crop.oy, side, side, 0, 0, F, F);
+  return true;
+}
+
+/* ---------- hand tracking ---------- */
+let hands = null;
+let handState = "loading";        // loading | ready | unavailable
+let handCount = 0;
+let tips = [];                    // fingertips in mirrored square space, 0..1
+const smoothTips = new Map();
+
+async function loadHands() {
+  try {
+    const { FilesetResolver, HandLandmarker } = await import(`${TASKS_URL}/vision_bundle.mjs`);
+    const fileset = await FilesetResolver.forVisionTasks(`${TASKS_URL}/wasm`);
+    const make = delegate => HandLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: MODEL_URL, delegate },
+      runningMode: "VIDEO",
+      numHands: 2,
+      minHandDetectionConfidence: 0.5,
+      minHandPresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+    try { hands = await make("GPU"); } catch { hands = await make("CPU"); }
+    handState = "ready";
+  } catch (err) {
+    console.warn("Hand tracking unavailable:", err);
+    handState = "unavailable";
+  }
+}
+
+function readHands(result) {
+  const list = result.landmarks || [];
+  const sides = result.handednesses || result.handedness || [];
+  const next = [];
+  const used = new Set();
+  list.forEach((lms, i) => {
+    let side = sides[i]?.[0]?.categoryName || `h${i}`;
+    if (used.has(side)) side += i;
+    used.add(side);
+    for (const id of TIP_IDS) {
+      const p = lms[id];
+      const sx = (p.x * crop.vw - crop.ox) / crop.side;
+      const sy = (p.y * crop.vh - crop.oy) / crop.side;
+      const raw = { x: 1 - sx, y: sy };
+      const key = side + id;
+      const prev = smoothTips.get(key);
+      let t = raw;
+      if (prev && Math.hypot(prev.x - raw.x, prev.y - raw.y) < 0.15) {
+        t = { x: prev.x + (raw.x - prev.x) * 0.6, y: prev.y + (raw.y - prev.y) * 0.6 };
+      }
+      smoothTips.set(key, t);
+      next.push(t);
+    }
+  });
+  if (!list.length) smoothTips.clear();
+  handCount = list.length;
+  tips = next;
+}
+
+/* ---------- drawing ---------- */
+let S = 0, lw = 1, fs = 8, logCell = null;
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  S = Math.max(1, Math.round(frameEl.getBoundingClientRect().width * dpr));
+  canvas.width = canvas.height = S;
+  lw = Math.max(1, Math.round(S / 520));
+  fs = Math.max(7, Math.round(S * 0.0105));
+}
+new ResizeObserver(resize).observe(frameEl);
+
+const num = v => (v === 0 ? "0.0" : v === 1 ? "1.0" : String(v));
+
+function draw(showFeed) {
+  const px = v => Math.round(v * S);
+  const half = lw % 2 ? 0.5 : 0;
+
+  if (showFeed) {
+    const F = buf.width;
+    for (const c of leaves) {
+      const x0 = px(c.x), y0 = px(c.y), x1 = px(c.x + c.W), y1 = px(c.y + c.H);
+      if (x1 <= x0 || y1 <= y0) continue;
+      ctx.drawImage(buf, c.u * F, c.v * F, c.w * F, c.h * F, x0, y0, x1 - x0, y1 - y0);
+    }
+  } else {
+    ctx.fillStyle = WAIT_FILL;
+    ctx.fillRect(0, 0, S, S);
+  }
+
+  // grid lines: one per split, plus the outer frame
+  ctx.strokeStyle = LINE;
+  ctx.lineWidth = lw;
+  ctx.beginPath();
+  for (const n of splits) {
+    if (n.ax === 0) {
+      const x = px(n.x + n.W * n.d) + half;
+      ctx.moveTo(x, px(n.y)); ctx.lineTo(x, px(n.y + n.H));
+    } else {
+      const y = px(n.y + n.H * n.d) + half;
+      ctx.moveTo(px(n.x), y); ctx.lineTo(px(n.x + n.W), y);
+    }
+  }
+  ctx.rect(lw / 2, lw / 2, S - lw, S - lw);
+  ctx.stroke();
+
+  // cell readouts
+  ctx.font = `${fs}px ${MONO}`;
+  ctx.textBaseline = "top";
+  ctx.fillStyle = INK;
+  ctx.shadowColor = "rgba(0, 0, 0, 0.35)";
+  ctx.shadowOffsetY = Math.max(1, Math.round(fs / 8));
+  const lh = Math.round(fs * 1.3), pad = Math.round(fs * 0.9);
+  let biggest = null, bigArea = 0;
+  for (const c of leaves) {
+    const w = c.W * S, h = c.H * S;
+    if (w * h > bigArea) { bigArea = w * h; biggest = c; }
+    if (c.index % 3 !== 0 || w < fs * 14 || h < lh * 7 + pad * 2) continue;
+    const x = px(c.x) + pad, y = px(c.y) + pad;
+    const rows = ["index  u  v  w  h", String(c.index), num(c.x), num(c.y), num(c.W), num(c.H)];
+    rows.forEach((t, i) => ctx.fillText(t, x, y + i * lh));
+  }
+
+  // status log, parked in the largest cell
+  if (!logCell || logCell.W * logCell.H * S * S * 1.3 < bigArea) logCell = biggest;
+  if (logCell && logCell.H * S > lh * 11) {
+    const status = !live ? ">> camera waiting"
+      : handState === "loading" ? ">> hand model loading"
+      : handState === "unavailable" ? ">> hand model unavailable"
+      : `>> hands ${handCount} | tips ${tips.length}`;
+    const lines = [status, `bsp.rebalance depth=${treeDepth} cells=${leaves.length}`];
+    const widest = Math.max(...lines.map(t => ctx.measureText(t).width));
+    if (logCell.W * S > widest + pad * 2) {
+      const x = px(logCell.x) + pad;
+      const y = px(logCell.y + logCell.H) - pad - lines.length * lh;
+      lines.forEach((t, i) => ctx.fillText(t, x, y + i * lh));
+    }
+  }
+  ctx.shadowColor = "transparent";
+  ctx.shadowOffsetY = 0;
+
+  // fingertip points, pinned to where the fingertip lands in the deformed image
+  const r = Math.max(3, S * 0.0085);
+  for (const t of tips) {
+    if (t.x < -0.02 || t.x > 1.02 || t.y < -0.02 || t.y > 1.02) continue;
+    const [mx, my] = mapPoint(clamp01(t.x), clamp01(t.y));
+    ctx.beginPath();
+    ctx.arc(mx * S, my * S, r + Math.max(1.5, lw * 1.25), 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(0, 0, 0, 0.28)";
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(mx * S, my * S, r, 0, Math.PI * 2);
+    ctx.fillStyle = PINEAPPLE;
+    ctx.fill();
+    ctx.lineWidth = Math.max(1.5, lw * 1.25);
+    ctx.strokeStyle = "#FFFFFF";
+    ctx.stroke();
+  }
+}
+
+/* ---------- loop ---------- */
+let lastNow = performance.now();
+let lastVideoTime = -1;
+
+function tick(now) {
+  const dt = Math.min(0.05, Math.max(0, (now - lastNow) / 1000));
+  lastNow = now;
+
+  let hasFrame = false;
+  if (live && video.readyState >= 2) {
+    hasFrame = grabFrame();
+    if (hasFrame && hands && video.currentTime !== lastVideoTime) {
+      lastVideoTime = video.currentTime;
+      try { readHands(hands.detectForVideo(video, now)); } catch (err) { /* skip this frame */ }
+    }
+  }
+  if (!live && tips.length) { tips = []; handCount = 0; }
+
+  relax(dt);
+  place(root, 0, 0, 1, 1);
+  if (S) draw(hasFrame);
+  requestAnimationFrame(tick);
+}
+
+buildTree();
+resize();
+loadHands();
+startCamera();
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
